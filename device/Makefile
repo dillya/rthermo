@@ -9,7 +9,7 @@ TARGETNAME := _target_sdcc_nrf24le1_$(PINS)
 
 # Add include directories (outside this folder) that make needs to know about (separated by a space)
 # These MUST be the relative path from within this directory to the desired directory (no absolute paths)
-export EXTERNINCDIRS = ../nRF24LE1_SDK/$(TARGETNAME)/include ../nRF24LE1_SDK/include
+export EXTERNINCDIRS = ../nRF24LE1_SDK/$(TARGETNAME)/include ../nRF24LE1_SDK/include ../include .
 export EXTERNLIBDIRS = ../nRF24LE1_SDK/$(TARGETNAME)/lib
 
 # Functions needed by this makefile
@@ -35,6 +35,9 @@ LK = sdcc
 DFLAGS = -MM $(INCDIRS) $<
 CFLAGS = --model-large --std-c99 $(INCDIRS) -c $< -o "$(OBJDIR)/"
 LFLAGS = --model-large --code-loc 0x0000 --code-size 0x4000 --xram-loc 0x0000 --xram-size 0x400 -o $(MAINIHX) $(LIBDIRS) $(LIBFILES) $(OBJFILES)
+
+# Do not clear memory at reset
+export SDCC_NOGENRAMCLEAR=1
 
 # File extensions for dependency files, source files, object files, and library files, respectively
 DEPEXT = d
