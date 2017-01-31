@@ -1,0 +1,3 @@
+[submodule "nRF24LE1_SDK"]
+	path = nRF24LE1_SDK
+	url = https://github.com/dillya/nRF24LE1_SDK.git
