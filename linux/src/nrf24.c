@@ -1034,7 +1034,8 @@ int nrf24_rx_wait(struct nrf24 *nrf, long timeout_ms, uint8_t *pipe)
 				break;
 
 			/* Wait 1ms before next check */
-			if (usleep(1000) == EINTR)
+			ret = usleep(1000);
+			if (ret < 0 && errno == EINTR)
 				return NRF24_WAIT_INTERRUPT;
 		}
 
@@ -1044,7 +1045,7 @@ int nrf24_rx_wait(struct nrf24 *nrf, long timeout_ms, uint8_t *pipe)
 		if (ret) {
 			if (ret == GPIO_IRQ_TIMEOUT)
 				return NRF24_WAIT_TIMEOUT;
-			if (ret == EINTR)
+			if (errno == EINTR)
 				return NRF24_WAIT_INTERRUPT;
 			return ret;
 		}
@@ -1080,7 +1081,8 @@ int nrf24_tx_wait(struct nrf24 *nrf, long timeout_ms)
 				break;
 
 			/* Wait 1ms before next check */
-			if (usleep(1000) == EINTR)
+			ret = usleep(1000);
+			if (ret < 0 && errno == EINTR)
 				return NRF24_WAIT_INTERRUPT;
 		}
 	} else {
@@ -1089,7 +1091,7 @@ int nrf24_tx_wait(struct nrf24 *nrf, long timeout_ms)
 		if (ret) {
 			if (ret == GPIO_IRQ_TIMEOUT)
 				return NRF24_WAIT_TIMEOUT;
-			if (ret == EINTR)
+			if (errno == EINTR)
 				return NRF24_WAIT_INTERRUPT;
 			return ret;
 		}
