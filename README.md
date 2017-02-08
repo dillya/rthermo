@@ -1,4 +1,4 @@
-# RThermo: remote Thermostat basde on nRF24L01+ wireless tranciever
+# RThermo: remote thermostat based on nRF24L01+ wireless tranciever
 
 RThermo is an Open source and Open Hardware project which consists on a wireless network for house temperature control. It is composed of a main controller running on a Linux powered device (connected to a nRF24L01(+)) and many remote devices based on Low power Nordic Semiconductor nRF24LE1.
 
