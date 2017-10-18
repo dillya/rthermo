@@ -568,24 +568,249 @@ static int controller_wait_tx(struct controller *ctrl, long timeout_ms)
 	return ret;
 }
 
+static inline int controller_process_pairing(struct controller *ctrl,
+					     struct rthermo_cmd_req *req,
+					     uint8_t size)
+{
+	struct rthermo_cmd_pair_req *pair_req = &req->pair;
+	struct rthermo_cmd_resp resp;
+	uint8_t address[RTHERMO_ADDRESS_WIDTH];
+	int next = 0;
+	int ret;
+
+	/* Bad request command (only PAIR is allowed in pairing mode) */
+	if (size != RTHERMO_CMD_PAIR_REQ_LENGTH ||
+	    req->cmd != RTHERMO_CMD_PAIR_REQ)
+		return 1;
+
+	/* Print pairing request */
+	if (ctrl->verbose) {
+		fprintf(stderr, "New pairing request:\n"
+			" - id: %d\n",
+			req->id);
+		print_address(" - address: ", pair_req->address);
+		print_serial(" - serial: ", pair_req->serial);
+		fprintf(stderr, " - caps: 0x%08x\n", pair_req->caps);
+	}
+
+	/* Check if device already exists */
+	ret = controller_find_device(ctrl, pair_req->address, pair_req->serial);
+	if (ret > 0) {
+		if (ctrl->verbose)
+			fprintf(stderr, "Device already paired\n");
+		return ret;
+	}
+
+	/* Switch to TX mode for pairing response */
+	controller_set_pairing_mode_tx(ctrl);
+
+	/* Find next free device slot */
+	next = controller_find_next_free_device(ctrl);
+
+	/* Generate device address from main controller address */
+	memcpy(address, ctrl->address, RTHERMO_ADDRESS_WIDTH);
+	address[0] += next;
+
+	/* Prepare pairing response */
+	resp.cmd = RTHERMO_CMD_PAIR_RESP;
+	resp.id = req->id;
+	memcpy(resp.pair.address, address, RTHERMO_ADDRESS_WIDTH);
+	memcpy(resp.pair.main_address, ctrl->address, RTHERMO_ADDRESS_WIDTH);
+
+	/* Print pairing response */
+	if (ctrl->verbose) {
+		fprintf(stderr, "Send pairing response:\n");
+		print_address(" - address: ", address);
+	}
+
+	/* Send response */
+	ret = nrf24_tx_write(ctrl->nrf, (uint8_t *) &resp,
+			     RTHERMO_CMD_PAIR_RESP_LENGTH, 1);
+	if (ret) {
+		fprintf(stderr, "Failed to send pairing response\n");
+		controller_set_pairing_mode_rx(ctrl);
+		return 1;
+	}
+
+	/* Wait for acknowledge */
+	ret = controller_wait_tx(ctrl, 1000);
+	if (ret) {
+		/* An error occured */
+		if (ret < 0)
+			return ret;
+
+		/* No acknowledge */
+		fprintf(stderr, "No pairing response acknowledge received\n");
+		controller_set_pairing_mode_rx(ctrl);
+		return 1;
+	}
+
+	/* Add device */
+	ret = controller_add_device(ctrl, next, resp.pair.address,
+				    pair_req->serial, pair_req->caps);
+	if (ret)
+		fprintf(stderr, "Failed to add device\n");
+
+	/* Print success */
+	if (ctrl->verbose) {
+		fprintf(stderr, "New device added:\n"
+			" - dev: %d\n", next);
+		print_address(" - address: ", address);
+		print_serial(" - serial: ", pair_req->serial);
+		fprintf(stderr, " - caps: 0x%08x\n", pair_req->caps);
+	}
+
+	/* Switch to RX mode */
+	if (ctrl->devs_count == RTHERMO_MAX_DEVICES) {
+		controller_set_normal_mode(ctrl, 1);
+		ctrl->pairing = 0;
+		if (ctrl->verbose)
+			fprintf(stderr, "All devices are registered: switch to normal mode\n");
+	} else
+		controller_set_pairing_mode_rx(ctrl);
+
+	return 0;
+}
+
+static inline int controller_process_normal(struct controller *ctrl,
+					    struct rthermo_cmd_req *req,
+					    uint8_t size, uint8_t pipe)
+{
+	struct rthermo_cmd_status_req *status_req = &req->status;
+	struct rthermo_cmd_resp resp;
+	struct remote_device *dev = &ctrl->devs[pipe];
+	struct timeval now;
+	double temperature;
+	int ret;
+
+	/* Check which pipe received request command */
+	if (pipe >= RTHERMO_MAX_DEVICES || dev->used)
+		return 1;
+
+	/* Process command */
+	switch (req->cmd) {
+	case RTHERMO_CMD_PING_REQ:
+		/* Bad request command size */
+		if (size != RTHERMO_CMD_PING_REQ_LENGTH)
+			return 1;
+
+		/* Print ping request */
+		if (ctrl->verbose)
+			fprintf(stderr, "New ping request:\n");
+
+		/* Switch to TX mode for ping response */
+		controller_set_normal_mode_tx(ctrl);
+
+		/* Get current time */
+		if (gettimeofday(&now, NULL))
+			return 1;
+
+		/* Prepare ping response */
+		size = RTHERMO_CMD_PING_RESP_LENGTH;
+		resp.cmd = RTHERMO_CMD_PING_RESP;
+		resp.id = req->id;
+		resp.ping.time = now.tv_sec;
+
+		/* Print status response */
+		if (ctrl->verbose)
+			fprintf(stderr, "Send ping response:\n"
+				" - time: 0x%08x\n",
+				resp.ping.time);
+
+		break;
+	case RTHERMO_CMD_STATUS_REQ:
+		/* Bad request command size */
+		if (size != RTHERMO_CMD_STATUS_REQ_LENGTH)
+			return 1;
+
+		/* Print status request */
+		if (ctrl->verbose) {
+			fprintf(stderr, "New status request:\n");
+			print_serial(" - serial: ", status_req->serial);
+			fprintf(stderr, " - id: %d\n"
+				" - status: 0x%08x\n"
+				" - temperature: 0x%08x\n"
+				" - battery: 0x%02x\n",
+				req->id, status_req->status,
+				status_req->temperature,
+				status_req->battery);
+		}
+
+		/* Check serial in request */
+		ret = memcmp(status_req->serial, ctrl->devs[pipe].serial,
+			     RTHERMO_SERIAL_WIDTH);
+		if (ret)
+			return 1;
+
+		/* Get temperature (from device or controller) */
+		if (dev->local)
+			temperature = rthermo_temperature_uint32_to_double(
+						       status_req->temperature);
+		else
+			temperature = 0; /* TODO */
+
+		/* Process temperature control */
+		dev->status = 0; /* TODO */
+
+		/* Add values to database */
+		db_set_temperature(ctrl->db, pipe + 1, time(NULL), temperature,
+				   dev->status);
+
+		/* Switch to TX mode for status response */
+		controller_set_normal_mode_tx(ctrl);
+
+		/* Prepare status response */
+		size = RTHERMO_CMD_STATUS_RESP_LENGTH;
+		resp.cmd = RTHERMO_CMD_STATUS_RESP;
+		resp.id = req->id;
+		resp.status.status = ctrl->devs[pipe].status;
+
+		/* Print status response */
+		if (ctrl->verbose)
+			fprintf(stderr, "Send status response:\n"
+				" - status: 0x%08x\n",
+				resp.status.status);
+
+		break;
+	default:
+		/* Unsupported command */
+		return 1;
+	}
+
+	/* Send response */
+	ret = nrf24_tx_write(ctrl->nrf, (uint8_t *) &resp, size, 1);
+	if (ret) {
+		fprintf(stderr, "Failed to send response\n");
+		controller_set_normal_mode_rx(ctrl);
+		return 1;
+	}
+
+	/* Wait for acknowledge */
+	ret = controller_wait_tx(ctrl, 1000);
+	if (ret) {
+		/* An error occured */
+		if (ret < 0)
+			return ret;
+
+		/* No acknowledge */
+		fprintf(stderr, "No response acknowledge received\n");
+	}
+
+	/* Switch to RX mode */
+	controller_set_normal_mode_rx(ctrl);
+
+	return 0;
+}
+
 static void *controller_thread(void *user_data)
 {
 	struct controller *ctrl = user_data;
 	struct nrf24 *nrf = ctrl->nrf;
 	uint8_t buffer[32];
 	struct rthermo_cmd_req *req = (struct rthermo_cmd_req *) buffer;
-	struct rthermo_cmd_resp resp;
-	struct rthermo_cmd_pair_req *pair_req = &req->pair;
-	struct rthermo_cmd_status_req *status_req = &req->status;
-	uint8_t address[RTHERMO_ADDRESS_WIDTH];
 	uint8_t pipe, size;
-	double temperature;
 	int pairing = 0;
-	int next = 0;
 	int ret;
-
-	/* Copy main controller address for device address generation */
-	memcpy(address, ctrl->address, RTHERMO_ADDRESS_WIDTH);
 
 	/* Setup nRF24L01(+) */
 	nrf24_setup_full(nrf, &ctrl->nrf_setup);
@@ -643,180 +868,15 @@ static void *controller_thread(void *user_data)
 		if (nrf24_rx_read(ctrl->nrf, buffer, size))
 			continue;
 
-		/* Check mode */
-		if (ctrl->pairing) {
-			/* Check pairing request command */
-			if (size != RTHERMO_CMD_PAIR_REQ_LENGTH ||
-			    req->cmd != RTHERMO_CMD_PAIR_REQ)
-				continue;
+		/* Process request */
+		if (ctrl->pairing)
+			ret = controller_process_pairing(ctrl, req, size);
+		else
+			ret = controller_process_normal(ctrl, req, size, pipe);
 
-			/* Print pairing request */
-			if (ctrl->verbose) {
-				fprintf(stderr, "New pairing request:\n"
-					" - id: %d\n",
-					req->id);
-				print_address(" - address: ",
-					      pair_req->address);
-				print_serial(" - serial: ", pair_req->serial);
-				fprintf(stderr, " - caps: 0x%08x\n",
-					pair_req->caps);
-			}
-
-			/* Check if device already exists */
-			if (controller_find_device(ctrl, pair_req->address,
-						   pair_req->serial) > 0) {
-				if (ctrl->verbose)
-					fprintf(stderr, "Device already "
-						"paired\n");
-				continue;
-			}
-
-			/* Switch to TX mode for pairing response */
-			controller_set_pairing_mode_tx(ctrl);
-
-			/* Find next free device slot */
-			next = controller_find_next_free_device(ctrl);
-
-			/* Generate device address */
-			address[0] = ctrl->address[0] + next;
-
-			/* Prepare pairing response */
-			resp.cmd = RTHERMO_CMD_PAIR_RESP;
-			resp.id = req->id;
-			memcpy(resp.pair.address, address,
-			       RTHERMO_ADDRESS_WIDTH);
-			memcpy(resp.pair.main_address, ctrl->address,
-			       RTHERMO_ADDRESS_WIDTH);
-
-			/* Print pairing response */
-			if (ctrl->verbose) {
-				fprintf(stderr, "Send pairing response:\n");
-				print_address(" - address: ", address);
-			}
-
-			/* Send response */
-			if (nrf24_tx_write(ctrl->nrf, (uint8_t *) &resp,
-					   RTHERMO_CMD_PAIR_RESP_LENGTH, 1)) {
-				fprintf(stderr, "Failed to send pairing "
-					"response\n");
-				controller_set_pairing_mode_rx(ctrl);
-				continue;
-			}
-
-			/* Wait for acknowledge */
-			ret = controller_wait_tx(ctrl, 1000);
-			if (ret) {
-				/* An error occured */
-				if (ret < 0)
-					break;
-
-				/* No acknowledge */
-				fprintf(stderr, "No pairing response "
-					"acknowledge received\n");
-					controller_set_pairing_mode_rx(ctrl);
-					continue;
-			}
-
-			/* Add device */
-			if (controller_add_device(ctrl, next, resp.pair.address,
-						  pair_req->serial,
-						  pair_req->caps))
-				fprintf(stderr, "Failed to add device\n");
-
-			/* Print success */
-			if (ctrl->verbose) {
-				fprintf(stderr, "New device added:\n"
-					" - dev: %d\n", next);
-				print_address(" - address: ", address);
-				print_serial(" - serial: ", pair_req->serial);
-				fprintf(stderr, " - caps: 0x%08x\n",
-					pair_req->caps);
-			}
-
-			/* Switch to RX mode */
-			if (ctrl->devs_count == RTHERMO_MAX_DEVICES) {
-				controller_set_normal_mode(ctrl, 1);
-				ctrl->pairing = 0;
-				if (ctrl->verbose)
-					fprintf(stderr, "All devices are "
-						"registered: switch to normal "
-						"mode\n");
-			} else
-				controller_set_pairing_mode_rx(ctrl);
-		} else {
-			/* Check status request command */
-			if (pipe >= RTHERMO_MAX_DEVICES ||
-			    size != RTHERMO_CMD_STATUS_REQ_LENGTH ||
-			    req->cmd != RTHERMO_CMD_STATUS_REQ)
-				continue;
-
-			/* Print status request */
-			if (ctrl->verbose) {
-				fprintf(stderr, "New status request:\n");
-				print_serial(" - serial: ", status_req->serial);
-				fprintf(stderr, " - id: %d\n"
-					" - status: 0x%08x\n"
-					" - temperature: 0x%08x\n"
-					" - battery: 0x%02x\n",
-					req->id, status_req->status,
-					status_req->temperature,
-					status_req->battery);
-			}
-
-			/* Check serial in request */
-			if (memcmp(status_req->serial, ctrl->devs[pipe].serial,
-				   RTHERMO_SERIAL_WIDTH))
-				continue;
-
-			/* Temperature control */
-			temperature = rthermo_temperature_uint32_to_double(
-						       status_req->temperature);
-			/* TODO */
-			ctrl->devs[pipe].status = 0;
-
-			/* Add values to database */
-			db_set_temperature(ctrl->db, pipe + 1, time(NULL),
-					   temperature,
-					   ctrl->devs[pipe].status);
-
-			/* Switch to TX mode for status response */
-			controller_set_normal_mode_tx(ctrl);
-
-			/* Prepare pairing response */
-			resp.cmd = RTHERMO_CMD_STATUS_RESP;
-			resp.id = req->id;
-			resp.status.status = ctrl->devs[pipe].status;
-
-			/* Print status response */
-			if (ctrl->verbose)
-				fprintf(stderr, "Send status response:\n"
-					" - status: 0x%08x\n",
-					resp.status.status);
-
-			/* Send response */
-			if (nrf24_tx_write(ctrl->nrf, (uint8_t *) &resp,
-					   RTHERMO_CMD_STATUS_RESP_LENGTH, 1)) {
-				fprintf(stderr, "Failed to send status "
-					"response\n");
-				controller_set_normal_mode_rx(ctrl);
-				continue;
-			}
-
-			/* Wait for acknowledge */
-			ret = controller_wait_tx(ctrl, 1000);
-			if (ret) {
-				/* An error occured */
-				if (ret < 0)
-					break;
-
-				/* No acknowledge */
-				fprintf(stderr, "No status response acknowledge"
-					" received\n");
-			}
-
-			/* Switch to RX mode */
-			controller_set_normal_mode_rx(ctrl);
-		}
+		/* An critical error occurred */
+		if (ret < 0)
+			break;
 	}
 
 	return NULL;
